@@ -12,6 +12,17 @@ if MTD_RAW_NAND
 
 comment "Raw/parallel NAND flash controllers"
 
+config MTD_NAND_CHIPLAB
+	tristate "Loongson chiplab APB NAND controller"
+	depends on OF
+	help
+	  This enables the driver for the APB NAND controller found on the
+	  Loongson chiplab (Artix-7 A200T) RV32 lab board, together with the
+	  platform DMA engine (confreg order register).  The controller has no
+	  hardware ECC engine, so the driver carries the self contained BCH-4
+	  codec which is bit-for-bit identical to the U-Boot one
+	  (u-boot/drivers/mtd/nand/raw/chiplab_nand.h).
+
 config MTD_NAND_DENALI
 	tristate
 

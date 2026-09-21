@@ -128,11 +128,47 @@
 			status = "disabled";
 		};
 
-		/* APB NAND 控制器（L5 阶段再做驱动，先登记地址） */
+		/*
+		 * APB NAND 控制器（K9F1G08U0C，128 MiB）+ 平台 DMA order 寄存器
+		 * （confreg 0x1FD0_0000 + 0x1160）。控制器无硬件 ECC，驱动自带
+		 * 自包含 BCH-4，布局与 U-Boot 逐字节同源（04-nand-driver.md §4.3）。
+		 *
+		 * 分区口径与 U-Boot mtdparts 同源（01-overview.md §3.1，全部
+		 * 128 KiB 块对齐）：
+		 *   env    0x0000_0000 + 256 KiB（2 块）
+		 *   kernel 0x0004_0000 + 50 MiB（400 块）
+		 *   dtb    0x0324_0000 + 1 MiB（8 块）
+		 *   rootfs 0x0334_0000 + 剩余 76.75 MiB（614 块）
+		 */
 		nand: nand@1fe78000 {
 			compatible = "loongson,chiplab-nand";
-			reg = <0x1fe78000 0x100>;
-			status = "disabled";
+			reg = <0x1fe78000 0x1000>, <0x1fd00000 0x10000>;
+			loongson,dma-order-offset = <0x1160>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				partition@0 {
+					label = "env";
+					reg = <0x00000000 0x00040000>;
+				};
+				partition@40000 {
+					label = "kernel";
+					reg = <0x00040000 0x03200000>;
+				};
+				partition@3240000 {
+					label = "dtb";
+					reg = <0x03240000 0x00100000>;
+				};
+				partition@3340000 {
+					label = "rootfs";
+					reg = <0x03340000 0x04cc0000>;
+				};
+			};
 		};
 	};
 };
