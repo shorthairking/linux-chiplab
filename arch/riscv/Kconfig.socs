@@ -117,4 +117,19 @@ config SOC_CANAAN_K210
 	help
 	  This enables support for Canaan Kendryte K210 SoC platform hardware.
 
+config SOC_CHIPLAB
+	bool "Loongson Chiplab (Artix-7 A200T RV32 lab board)"
+	select SIFIVE_PLIC
+	select SERIAL_8250
+	select SERIAL_8250_CONSOLE
+	select SERIAL_OF_PLATFORM
+	help
+	  This enables support for the Loongson chiplab RV32-GC SoC on the
+	  Artix-7 A200T experiment board: one RV32IMAFDC hart with Sv32,
+	  128 MiB DDR3, a 16550 UART at 0x1FE001E0, a CLINT and a
+	  SiFive-style PLIC with 31 sources.
+
+	  The kernel runs in S-mode on top of OpenSBI (SBI v0.2+); timer,
+	  IPI and reset services are provided through SBI calls.
+
 endmenu # "SoC selection"

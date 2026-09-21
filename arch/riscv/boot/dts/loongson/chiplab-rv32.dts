@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * Loongson Chiplab RV32 board (chiplab FPGA SoC on Xilinx Artix-7 A200T)
+ *
+ * 地址/时钟口径唯一真源：rv32gc-cpu/docs/kb/platform-facts.md
+ *   DDR3        0x0000_0000 - 0x07FF_FFFF (128 MiB)   §2.1
+ *   SPI XIP     0x1C00_0000（别名 0x1FE8_0000，16 MiB） §2.3
+ *   UART 16550  0x1FE0_01E0 (33 MHz, 115200, reg-shift=0) §2.5 / §5
+ *   NAND        0x1FE7_8000（预留，见 rv32gc-cpu/docs/porting/04-nand-driver.md）
+ *   CLINT       0x1F00_0000（核内私有，§2.4 / §9 U8）
+ *   PLIC        0x1F10_0000（同上，31 sources）
+ *
+ * 运行口径：OpenSBI(M) + Linux(S, Sv32, SBI v0.2+)，本树只描述 S 模式可见的硬件。
+ * ISA 串必须用新接口（riscv,isa-base + riscv,isa-extensions）：
+ * 7.3 内核默认不再解析旧的 riscv,isa 字符串（arch/riscv/kernel/cpu.c:68-113）。
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "loongson,chiplab-rv32";
+	model = "Loongson Chiplab RV32 (Artix-7 A200T)";
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200n8 earlycon=sbi ignore_loglevel";
+		stdout-path = "serial0:115200n8";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* 33 MHz uncore 域（platform-facts.md §5，config.h:33 FREQ） */
+		timebase-frequency = <33000000>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa-base = "rv32i";
+			/*
+			 * 只列 QEMU 模型/平台真正实现的扩展（claim 未实现的扩展
+			 * 会让内核执行非法指令）：IMAFDC + Zicsr/Zifencei/Zicntr。
+			 * 平台 DTS（U-Boot 侧）另列了 zicbom，本树不列（内核不用
+			 * cbo.* 也能跑，QEMU rv32 默认 CPU 不保证实现）。
+			 */
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c",
+					       "zicsr", "zifencei", "zicntr";
+			mmu-type = "riscv,sv32";
+			clock-frequency = <33000000>;
+			i-cache-size = <0x4000>;	/* L1I 16 KiB */
+			i-cache-line-size = <32>;
+			d-cache-size = <0x8000>;	/* L1D 32 KiB */
+			d-cache-line-size = <32>;
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/* DDR3 128 MiB（platform-facts.md §2.1） */
+		reg = <0x00000000 0x08000000>;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		/*
+		 * CLINT：S 模式内核经 SBI 取定时器/IPI，本节点只登记口径
+		 * （M 模式由 OpenSBI 使用）。基址为 [旧项目转述]（PF §9 U8），
+		 * 与 QEMU -M chiplab 的 riscv_aclint 模型逐字一致。
+		 */
+		clint: clint@1f000000 {
+			compatible = "sifive,clint0", "riscv,clint0";
+			reg = <0x1f000000 0x10000>;
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+		};
+
+		/*
+		 * PLIC：每 hart 两个上下文（M 上下文 11 归 OpenSBI，S 上下文 9
+		 * 归 Linux）；内核只绑定 S 上下文（irq-sifive-plic.c 跳过
+		 * parent hwirq != RV_IRQ_EXT 的上下文）。
+		 */
+		plic: interrupt-controller@1f100000 {
+			compatible = "sifive,plic-1.0.0";
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			reg = <0x1f100000 0x400000>;
+			riscv,ndev = <31>;
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+		};
+
+		/*
+		 * 16550 UART：寄存器按字节排列（reg-shift=0 / reg-io-width=1）。
+		 * 中断号 1 是**本项目的 PLIC 源约定**（PF §9 U5 未定项的平台侧
+		 * 拍板口径），与 QEMU -M chiplab 的 UART→PLIC source 1 接线一致；
+		 * 真板 PLIC 映射未验证前，控制台输出不依赖中断。
+		 */
+		serial0: serial@1fe001e0 {
+			compatible = "ns16550a";
+			reg = <0x1fe001e0 0x100>;
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+			clock-frequency = <33000000>;
+			current-speed = <115200>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+		};
+
+		/* SPI XIP 窗口（引导介质；本阶段内核不从 SPI 读） */
+		spi: spi@1c000000 {
+			compatible = "loongson,chiplab-spi-xip";
+			reg = <0x1c000000 0x1000000>;	/* 16 MiB，与 QEMU 模型一致 */
+			status = "disabled";
+		};
+
+		/* APB NAND 控制器（L5 阶段再做驱动，先登记地址） */
+		nand: nand@1fe78000 {
+			compatible = "loongson,chiplab-nand";
+			reg = <0x1fe78000 0x100>;
+			status = "disabled";
+		};
+	};
+};
