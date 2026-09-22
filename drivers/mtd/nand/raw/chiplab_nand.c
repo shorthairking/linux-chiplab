@@ -215,6 +215,9 @@ static void cnand_read_status(struct chiplab_nand *p)
 	p->status = (u8)(cnand_rd(p, CHIPLAB_NAND_REG_STATUS_IDH) >> 16);
 }
 
+/* 由 SEQIN 锁存页号、PAGEPROG 提交的帧编程（定义在 ECC 一节） */
+static int chiplab_nand_commit_frame(struct chiplab_nand *p);
+
 /* ------------------------------------------------------------------ */
 /* exec_op：把框架发来的通用指令序列翻译成控制器高层命令                */
 /* ------------------------------------------------------------------ */
@@ -240,11 +243,32 @@ static int chiplab_nand_exec_op(struct nand_chip *chip,
 			switch (opcode) {
 			case NAND_CMD_READ0:
 			case NAND_CMD_READOOB:
+			case NAND_CMD_READSTART:
+				/*
+				 * 大页读的框架序列是
+				 *   CMD READ0(0x00) + ADDR + CMD READSTART(0x30) + WAITRDY + DATA_IN
+				 * 即 DATA_IN 之前**最后**一条 CMD 是 0x30。早期实现只认
+				 * READ0/READOOB，于是这种读落到 DATA_IN 的 default 分支，
+				 * 被静默填成 0xFF（UBIFS 读索引节点就是这么坏的：数据其实
+				 * 已在 NAND 上，读回却是 255 而且没有任何 ECC 报错）。
+				 * frame_loaded 在这里一并复位，保证真正读一次器件。
+				 */
 				frame_loaded = false;
 				break;
 			case NAND_CMD_SEQIN:
 				memset(p->frame, 0xff, sizeof(p->frame));
 				p->frame_len = CHIPLAB_NAND_PAGE_SPARE;
+				break;
+			case NAND_CMD_PAGEPROG:
+				/*
+				 * 与 u-boot 侧 cnand_cmdfunc() 的 p->page 语义同构：
+				 * 框架用 nand_prog_page_begin_op()(SEQIN+ADDR) 起页编程、
+				 * nand_prog_page_end_op()(PAGEPROG，**不带地址**) 收尾，
+				 * 所以页号必须在 SEQIN 拍锁存（见 ADDR 分支），
+				 * PAGEPROG 拍用锁存值提交——早期实现完全忽略 PAGEPROG，
+				 * 走到这条路径的写会静默丢弃（数据留在 p->frame 里）。
+				 */
+				ret = chiplab_nand_commit_frame(p);
 				break;
 			case NAND_CMD_ERASE2:
 				ret = cnand_erase_block(p, row);
@@ -269,12 +293,48 @@ static int chiplab_nand_exec_op(struct nand_chip *chip,
 			unsigned int n = instr->ctx.addr.naddrs;
 			const u8 *a = instr->ctx.addr.addrs;
 
-			if (n >= 2)
+			/*
+			 * 周期数与字段划分（ONFI 约定，**由实际周期数决定**）：
+			 *   5 周期（大页 + 3 行字节）：col[7:0] col[15:8] row[7:0] row[15:8] row[23:16]
+			 *   4 周期（大页 + 2 行字节）：col[7:0] col[15:8] row[7:0] row[15:8]
+			 *   4 周期（小页）            ：col[7:0]          row[7:0] row[15:8] row[23:16]
+			 *   3 周期（擦除）            ：                  row[7:0] row[15:8] row[23:16]
+			 * 本芯片 2048 B 页 / 65536 页 ⇒ 行地址 16 bit，框架发的是
+			 * **4 周期 = 2 列 + 2 行**；早期实现把 4 周期一律当"1 列 + 3 行"，
+			 * 于是 row 被算成 ((col>>8)) | (row_lo<<8) | (row_hi<<16)（例如
+			 * 页 27138 变成 6947840，超出器件范围 → 读回全 0xFF），
+			 * 而写路径用的是框架直接给的页号，所以"写对、读错"。
+			 * 擦除的地址里**没有列地址**（早期实现无条件把 a[0]/a[1] 当列地址，
+			 * 3 周期时 row 恒为 0，每次擦块 0——UBIFS 首次挂载即暴露）。
+			 */
+			if (opcode == NAND_CMD_ERASE1) {
+				col = 0;
+				row = (n >= 1 ? a[0] : 0) |
+				      (n >= 2 ? (a[1] << 8) : 0) |
+				      (n >= 3 ? (a[2] << 16) : 0);
+			} else if (n >= 5) {
 				col = a[0] | (a[1] << 8);
-			else if (n == 1)
+				row = a[2] | (a[3] << 8) | (a[4] << 16);
+			} else if (n == 4) {
+				if (nand_to_mtd(chip)->writesize > 512) {
+					col = a[0] | (a[1] << 8);
+					row = a[2] | (a[3] << 8);
+				} else {
+					col = a[0];
+					row = a[1] | (a[2] << 8) | (a[3] << 16);
+				}
+			} else if (n == 3) {
 				col = a[0];
-			if (n >= 4)
-				row = a[2] | (a[3] << 8) | (n >= 5 ? (a[4] << 16) : 0);
+				row = a[1] | (a[2] << 8);
+			} else if (n == 2) {
+				/* 只换列地址（nand_change_read_column_op / RNDOUT） */
+				col = a[0] | (a[1] << 8);
+			} else if (n >= 1) {
+				col = a[0];
+			}
+			/* SEQIN 拍锁存页号，PAGEPROG 拍（无地址）用它提交 */
+			if (opcode == NAND_CMD_SEQIN)
+				p->page = row;
 			/* col 是"页内"偏移：>=2048 落在备用区（与 U-Boot 同口径） */
 			if (opcode == NAND_CMD_READOOB && col < CHIPLAB_NAND_PAGE_SIZE)
 				col += CHIPLAB_NAND_PAGE_SIZE;
@@ -287,6 +347,7 @@ static int chiplab_nand_exec_op(struct nand_chip *chip,
 
 			switch (opcode) {
 			case NAND_CMD_READ0:
+			case NAND_CMD_READSTART:
 			case NAND_CMD_READOOB:
 				if (!frame_loaded) {
 					ret = cnand_read_frame(p, row);
@@ -294,6 +355,23 @@ static int chiplab_nand_exec_op(struct nand_chip *chip,
 						break;
 					frame_loaded = true;
 					p->page = row;
+				}
+				if (col + len > CHIPLAB_NAND_PAGE_SPARE)
+					len = CHIPLAB_NAND_PAGE_SPARE - col;
+				memcpy(buf, p->frame + col, len);
+				col += len;
+				break;
+			case NAND_CMD_RNDOUT:
+				/*
+				 * 只换列地址重读：帧在 READ0/READSTART 拍已整帧读入，
+				 * 这里直接从 frame 取（框架 nand_read_subpage/
+				 * nand_change_read_column_op 走这条）。
+				 */
+				if (!frame_loaded) {
+					ret = cnand_read_frame(p, p->page);
+					if (ret)
+						break;
+					frame_loaded = true;
 				}
 				if (col + len > CHIPLAB_NAND_PAGE_SPARE)
 					len = CHIPLAB_NAND_PAGE_SPARE - col;
@@ -319,7 +397,14 @@ static int chiplab_nand_exec_op(struct nand_chip *chip,
 					buf[0] = p->status;
 				break;
 			default:
-				memset(buf, 0xff, len);
+				/*
+				 * fail-closed：不再"静默填 0xFF"，否则任何没翻译的
+				 * 读都会变成"内容全 1 的空页"，上层的坏块/节点判据会
+				 * 得到假的成功（UBIFS 索引节点读回 255 就是这么来的）。
+				 */
+				dev_warn(p->dev, "chiplab-nand: unhandled DATA_IN opcode 0x%02x (len %u)\n",
+					 opcode, len);
+				ret = -EINVAL;
 				break;
 			}
 			break;
@@ -356,6 +441,25 @@ static int chiplab_ecc_calculate(struct nand_chip *chip, const u8 *data, u8 *ecc
 {
 	return chiplab_bch_encode(&chiplab_bch, data, CHIPLAB_NAND_ECC_STEP_SIZE,
 				  ecc, CHIPLAB_NAND_ECC_BYTES_PER_STEP);
+}
+
+/*
+ * PAGEPROG 拍提交：把 SEQIN 拍填好的 frame（数据 2048 + 备用区 64）按契约重算
+ * ECC 后编程到锁存的页。与 chiplab_write_page() 的区别只是**不再重置备用区**，
+ * 保留调用者（例如 nand_write_oob_std）已经写进 frame 的 OOB 字节。
+ */
+static int chiplab_nand_commit_frame(struct chiplab_nand *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < CHIPLAB_NAND_ECC_STEPS; i++)
+		chiplab_ecc_calculate(&p->chip,
+				      p->frame + i * CHIPLAB_NAND_ECC_STEP_SIZE,
+				      p->frame + CHIPLAB_NAND_PAGE_SIZE +
+				      CHIPLAB_NAND_ECC_FIRST_POS +
+				      i * CHIPLAB_NAND_ECC_BYTES_PER_STEP);
+
+	return cnand_program_frame(p, p->page);
 }
 
 /* 擦除态页判据：数据段+校验段里 0 的个数 ≤ 阈值即视为空白页 */
@@ -569,6 +673,28 @@ static void chiplab_nand_restamp_ecc(struct chiplab_nand *p)
 	chip->ecc.write_page_raw = chiplab_write_page_raw;
 	chip->ecc.read_oob = nand_read_oob_std;
 	chip->ecc.write_oob = nand_write_oob_std;
+
+	/*
+	 * **关掉框架的"子页读"**：nand_scan_tail() 见到 SOFT ECC + 大页
+	 * (page_shift > 9) 会**自动**置 chip->options |= NAND_SUBPAGE_READ
+	 * (nand_base.c:「Large page NAND with SOFT_ECC should support subpage
+	 * reads」)，于是 nand_do_read_ops() 把所有"非整页"读都交给框架的
+	 * nand_read_subpage()——它按**框架自己的** ECC 参数与 ooblayout 重新
+	 * 取列地址读页数据/读备用区 ECC 字节，与本驱动的自包含 BCH-4 布局
+	 * (4×512 B，ECC 在备用区 36..63) 不是一回事，短读一律拿回 0xFF：
+	 *   · UBI 的 64 B EC 头/VID 头读 → 每个 PEB 都判成"空白" ⇒
+	 *     "empty MTD device detected"、卷表读不到（user volume: 0）、
+	 *     每次启动都重格式化 ⇒ 什么都存不住；
+	 *   · UBIFS 的 48 B 索引节点读 → bad node type (255 but expected 9)。
+	 * 整页读(dd bs=2048 / nanddump / nandwrite 回读)不走这条路，所以此前
+	 * L5 交叉验证全绿却与 UBI/UBIFS 完全不兼容。
+	 * 控制器本来就把 2112 B 整帧搬进 p->frame，短读没有任何收益，
+	 * 直接让框架回到 ecc.read_page()（整页读 + 按请求长度拷贝）。
+	 * NAND_HAS_SUBPAGE_READ() 只看 options 位，所以必须清位（只清函数
+	 * 指针会变成空指针调用）。
+	 */
+	chip->options &= ~NAND_SUBPAGE_READ;
+	chip->ecc.read_subpage = NULL;
 
 	mtd_set_ooblayout(mtd, &chiplab_ooblayout_ops);
 	/* 框架按旧（Hamming）布局算过 oobavail，这里按契约重算：64-28-2 = 34 */
